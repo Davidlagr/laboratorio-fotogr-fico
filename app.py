@@ -1,7 +1,6 @@
 import io
 import math
 import base64
-import zipfile
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps, ImageDraw, ImageEnhance
@@ -64,6 +63,14 @@ QUALITY_PROFILES = {
     "Borrador / Prueba de encuadre (150 DPI)": 150,
 }
 
+# Opciones de rotación manual
+ROTATION_OPTIONS = {
+    "0° (Original)": 0,
+    "90° Derecha (Horario)": -90,
+    "90° Izquierda (Antihorario)": 90,
+    "180° (Invertida)": 180,
+}
+
 
 def cm_to_px(cm: float, dpi: int) -> int:
     return int(round((cm / 2.54) * dpi))
@@ -80,6 +87,34 @@ def load_image_corrected(uploaded_file) -> Image.Image:
         background.paste(img, mask=img.split()[3])
         return background
     return img.convert("RGB")
+
+
+def apply_rotation(
+    img: Image.Image,
+    global_mode: str,
+    individual_deg: int,
+    target_vertical: bool = True,
+) -> Image.Image:
+    """
+    Aplica rotación inteligente para impresión vertical o ángulos manuales
+    (global + individual por foto).
+    """
+    out = img
+    if global_mode == "Auto-girar horizontales a Vertical (90° Derecha)":
+        if target_vertical and out.width > out.height:
+            out = out.rotate(-90, expand=True)
+    elif global_mode == "Auto-girar horizontales a Vertical (90° Izquierda)":
+        if target_vertical and out.width > out.height:
+            out = out.rotate(90, expand=True)
+    elif global_mode in ROTATION_OPTIONS:
+        deg = ROTATION_OPTIONS[global_mode]
+        if deg != 0:
+            out = out.rotate(deg, expand=True)
+
+    if individual_deg != 0:
+        out = out.rotate(individual_deg, expand=True)
+
+    return out
 
 
 def apply_paper_optimization(img: Image.Image, paper_name: str) -> Image.Image:
@@ -100,12 +135,12 @@ def process_single_photo(
     target_w_px: int,
     target_h_px: int,
     fit_mode: str,
-    auto_rotate: bool,
+    auto_rotate_paper: bool,
     bg_color: tuple = (255, 255, 255),
     inner_margin_px: int = 0,
 ) -> Image.Image:
     """Ajusta una fotografía a las dimensiones exactas en píxeles."""
-    if auto_rotate:
+    if auto_rotate_paper:
         img_is_landscape = img.width > img.height
         target_is_landscape = target_w_px > target_h_px
         if img_is_landscape != target_is_landscape:
@@ -236,7 +271,6 @@ def trigger_direct_browser_print(images_list: list, page_w_cm: float, page_h_cm:
     for img in images_list:
         raw_bytes = export_image_bytes(img, dpi=dpi, fmt="JPEG")
         b64 = base64.b64encode(raw_bytes).decode("utf-8")
-        # Determinar si esta página individual es horizontal o vertical
         is_land = img.width > img.height
         w_page = max(page_w_cm, page_h_cm) if is_land else min(page_w_cm, page_h_cm)
         h_page = min(page_w_cm, page_h_cm) if is_land else max(page_w_cm, page_h_cm)
@@ -303,7 +337,7 @@ def trigger_direct_browser_print(images_list: list, page_w_cm: float, page_h_cm:
 # --- INTERFAZ DE USUARIO ---
 st.title("📸 Estudio de Impresión Fotográfica y Póster")
 st.markdown(
-    "Ajusta tus fotos a tamaños estándar, calibra el **tipo de papel y calidad**, e **imprime directamente** desde tu navegador o descarga para laboratorio."
+    "Ajusta tus fotos a tamaños estándar, **rótalas para impresión vertical**, calibra el **papel y calidad**, e **imprime directamente**."
 )
 
 tab1, tab2 = st.tabs(["🖨️ Ajustar e Imprimir Fotos", "🧩 Crear e Imprimir Póster"])
@@ -345,8 +379,29 @@ with tab1:
         )
         orientation = st.radio(
             "Orientación del papel",
-            ["Automática (según cada foto)", "Vertical (Retrato)", "Horizontal (Paisaje)"],
+            [
+                "Vertical (Retrato - Fijo)",
+                "Horizontal (Paisaje - Fijo)",
+                "Automática (según cada foto)",
+            ],
+            index=0,
         )
+
+        st.subheader("3. Rotación de Fotografías")
+        global_rot_1 = st.selectbox(
+            "Rotación general para encuadre",
+            options=[
+                "0° (Original)",
+                "Auto-girar horizontales a Vertical (90° Derecha)",
+                "Auto-girar horizontales a Vertical (90° Izquierda)",
+                "90° Derecha (Horario)",
+                "90° Izquierda (Antihorario)",
+                "180° (Invertida)",
+            ],
+            index=0,
+            help="Usa 'Auto-girar horizontales a Vertical' para rotar automáticamente fotos apaisadas y aprovechar toda la hoja vertical.",
+        )
+
         fit_mode = st.radio(
             "Modo de ajuste",
             [
@@ -356,7 +411,7 @@ with tab1:
         )
         border_mm = st.slider("Margen blanco interior (mm)", 0, 15, 0)
 
-        st.subheader("3. Ahorro de Papel (Opcional)")
+        st.subheader("4. Ahorro de Papel (Opcional)")
         pack_on_sheet = st.checkbox(
             "Agrupar varias fotos en hoja Carta o A4",
             value=False,
@@ -369,45 +424,55 @@ with tab1:
             cut_guides = st.checkbox("Dibujar líneas guía de corte", value=True)
 
     with col_prev:
-        st.subheader("Vista Previa e Impresión Directa")
+        st.subheader("Vista Previa, Ajuste Individual e Impresión")
         if uploaded_photos:
             w_cm, h_cm = PHOTO_SIZES_CM[size_label]
-            if orientation == "Horizontal (Paisaje)":
+            if "Horizontal" in orientation:
                 w_cm, h_cm = max(w_cm, h_cm), min(w_cm, h_cm)
-            elif orientation == "Vertical (Retrato)":
+            elif "Vertical" in orientation:
                 w_cm, h_cm = min(w_cm, h_cm), max(w_cm, h_cm)
 
             target_w = cm_to_px(w_cm, selected_dpi_1)
             target_h = cm_to_px(h_cm, selected_dpi_1)
-            auto_rot = orientation == "Automática (según cada foto)"
+            auto_rot_paper = "Automática" in orientation
+            is_target_vertical = "Vertical" in orientation
+
+            # Controles de rotación individual por foto
+            indiv_rotations_1 = []
+            with st.expander("🔄 Rotar fotos individualmente (opcional)", expanded=len(uploaded_photos) == 1):
+                rot_cols = st.columns(min(3, len(uploaded_photos)))
+                for idx, up in enumerate(uploaded_photos):
+                    with rot_cols[idx % 3]:
+                        r_choice = st.selectbox(
+                            f"Girar: {up.name[:18]}",
+                            options=list(ROTATION_OPTIONS.keys()),
+                            key=f"rot_std_{idx}_{up.name}",
+                        )
+                        indiv_rotations_1.append(ROTATION_OPTIONS[r_choice])
 
             processed_list = []
-            for up in uploaded_photos:
+            for idx, up in enumerate(uploaded_photos):
                 raw_img = load_image_corrected(up)
-                opt_img = apply_paper_optimization(raw_img, paper_choice_1)
+                rot_img = apply_rotation(
+                    raw_img,
+                    global_mode=global_rot_1,
+                    individual_deg=indiv_rotations_1[idx],
+                    target_vertical=is_target_vertical,
+                )
+                opt_img = apply_paper_optimization(rot_img, paper_choice_1)
                 proc = process_single_photo(
                     opt_img,
                     target_w,
                     target_h,
                     fit_mode=fit_mode,
-                    auto_rotate=auto_rot,
+                    auto_rotate_paper=auto_rot_paper,
                     inner_margin_px=cm_to_px(border_mm / 10.0, selected_dpi_1),
                 )
                 processed_list.append((up.name, proc))
 
             if pack_on_sheet:
                 sw_cm, sh_cm = PHOTO_SIZES_CM[sheet_type]
-                fixed_photos = [
-                    process_single_photo(
-                        apply_paper_optimization(load_image_corrected(up), paper_choice_1),
-                        target_w,
-                        target_h,
-                        fit_mode=fit_mode,
-                        auto_rotate=False,
-                        inner_margin_px=cm_to_px(border_mm / 10.0, selected_dpi_1),
-                    )
-                    for up in uploaded_photos
-                ]
+                fixed_photos = [x[1] for x in processed_list]
                 final_pages = build_multi_print_sheet(
                     fixed_photos,
                     cm_to_px(sw_cm, selected_dpi_1),
@@ -435,7 +500,6 @@ with tab1:
 
             st.caption(f"💡 **Ajuste recomendado en tu impresora:** {PAPER_PROFILES[paper_choice_1]['tip']}")
 
-            # Botón de Impresión Directa
             btn_col1, btn_col2 = st.columns(2)
             with btn_col1:
                 if st.button("🖨️ Imprimir Directamente Ahora", type="primary", use_container_width=True, key="btn_print_1"):
@@ -510,6 +574,20 @@ with tab2:
             key="poster_orient",
         )
 
+        global_rot_2 = st.selectbox(
+            "Rotación general de las fotos",
+            options=[
+                "0° (Original)",
+                "Auto-girar horizontales a Vertical (90° Derecha)",
+                "Auto-girar horizontales a Vertical (90° Izquierda)",
+                "90° Derecha (Horario)",
+                "90° Izquierda (Antihorario)",
+                "180° (Invertida)",
+            ],
+            index=0,
+            key="global_rot_2",
+        )
+
         st.subheader("3. Diseño y Cuadrícula")
         num_imgs = len(poster_files) if poster_files else 4
         default_cols = max(1, int(math.sqrt(num_imgs)))
@@ -543,10 +621,31 @@ with tab2:
             pw_px = cm_to_px(pw_cm, selected_dpi_2)
             ph_px = cm_to_px(ph_cm, selected_dpi_2)
 
-            loaded_poster_imgs = [
-                apply_paper_optimization(load_image_corrected(f), paper_choice_2)
-                for f in poster_files
-            ]
+            # Controles de rotación individual por foto en el póster
+            indiv_rotations_2 = []
+            with st.expander("🔄 Rotar fotos individuales del póster (opcional)", expanded=False):
+                p_rot_cols = st.columns(min(3, len(poster_files)))
+                for idx, pf in enumerate(poster_files):
+                    with p_rot_cols[idx % 3]:
+                        r_choice_p = st.selectbox(
+                            f"Foto #{idx + 1}: {pf.name[:14]}",
+                            options=list(ROTATION_OPTIONS.keys()),
+                            key=f"rot_poster_{idx}_{pf.name}",
+                        )
+                        indiv_rotations_2.append(ROTATION_OPTIONS[r_choice_p])
+
+            loaded_poster_imgs = []
+            for idx, f in enumerate(poster_files):
+                raw_p = load_image_corrected(f)
+                rot_p = apply_rotation(
+                    raw_p,
+                    global_mode=global_rot_2,
+                    individual_deg=indiv_rotations_2[idx],
+                    target_vertical=(poster_orient == "Vertical"),
+                )
+                opt_p = apply_paper_optimization(rot_p, paper_choice_2)
+                loaded_poster_imgs.append(opt_p)
+
             capacity = grid_cols * grid_rows
             if len(loaded_poster_imgs) > capacity:
                 st.warning(
