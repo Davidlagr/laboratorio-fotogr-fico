@@ -1,17 +1,18 @@
 import io
 import math
+import base64
 import zipfile
 import streamlit as st
-from PIL import Image, ImageOps, ImageDraw
+import streamlit.components.v1 as components
+from PIL import Image, ImageOps, ImageDraw, ImageEnhance
 
-# Configuración de página
 st.set_page_config(
     page_title="Estudio de Impresión Fotográfica & Póster",
     page_icon="📸",
     layout="wide",
 )
 
-# Diccionario de tamaños fotográficos estándar en centímetros (Ancho x Alto)
+# Tamaños fotográficos estándar en centímetros (Ancho x Alto)
 PHOTO_SIZES_CM = {
     "9 x 13 cm (3.5 x 5 in)": (9.0, 13.0),
     "10 x 15 cm (4 x 6 in - Estándar)": (10.16, 15.24),
@@ -28,15 +29,48 @@ PHOTO_SIZES_CM = {
     "60 x 90 cm (Póster Extra Grande)": (60.0, 90.0),
 }
 
-DPI = 300  # Resolución estándar de impresión fotográfica
+# Perfiles de papel fotográfico
+PAPER_PROFILES = {
+    "Papel Fotográfico Brillante (Glossy)": {
+        "sharpness": 1.12,
+        "contrast": 1.05,
+        "brightness": 1.0,
+        "tip": "En el cuadro de impresión elige: Tipo de papel → Papel Fotográfico Brillante (Photo Paper Plus Glossy II).",
+    },
+    "Papel Fotográfico Mate (Matte)": {
+        "sharpness": 1.18,
+        "contrast": 1.08,
+        "brightness": 1.04,
+        "tip": "En el cuadro de impresión elige: Tipo de papel → Papel Fotográfico Mate (Matte Photo Paper).",
+    },
+    "Papel Fotográfico Satinado / Semi-Brillante": {
+        "sharpness": 1.10,
+        "contrast": 1.03,
+        "brightness": 1.02,
+        "tip": "En el cuadro de impresión elige: Tipo de papel → Papel Fotográfico Semi-brillante / Satinado.",
+    },
+    "Papel Normal / Opalina (Borrador o Prueba)": {
+        "sharpness": 1.0,
+        "contrast": 1.0,
+        "brightness": 1.0,
+        "tip": "En el cuadro de impresión elige: Tipo de papel → Papel Normal.",
+    },
+}
+
+# Perfiles de calidad de impresión (DPI reales)
+QUALITY_PROFILES = {
+    "Máxima / Laboratorio (300 DPI - Alta calidad)": 300,
+    "Estándar / Rápida (200 DPI - Uso diario)": 200,
+    "Borrador / Prueba de encuadre (150 DPI)": 150,
+}
 
 
-def cm_to_px(cm: float, dpi: int = DPI) -> int:
+def cm_to_px(cm: float, dpi: int) -> int:
     return int(round((cm / 2.54) * dpi))
 
 
 def load_image_corrected(uploaded_file) -> Image.Image:
-    """Carga la imagen corrigiendo la orientación EXIF (fotos de celular) y convirtiendo a RGB."""
+    """Carga la imagen corrigiendo la orientación EXIF y convirtiendo a RGB."""
     img = Image.open(uploaded_file)
     img = ImageOps.exif_transpose(img)
     if img.mode in ("RGBA", "P"):
@@ -48,6 +82,19 @@ def load_image_corrected(uploaded_file) -> Image.Image:
     return img.convert("RGB")
 
 
+def apply_paper_optimization(img: Image.Image, paper_name: str) -> Image.Image:
+    """Ajusta nitidez, contraste y brillo según la absorción de tinta del papel seleccionado."""
+    profile = PAPER_PROFILES[paper_name]
+    out = img
+    if profile["brightness"] != 1.0:
+        out = ImageEnhance.Brightness(out).enhance(profile["brightness"])
+    if profile["contrast"] != 1.0:
+        out = ImageEnhance.Contrast(out).enhance(profile["contrast"])
+    if profile["sharpness"] != 1.0:
+        out = ImageEnhance.Sharpness(out).enhance(profile["sharpness"])
+    return out
+
+
 def process_single_photo(
     img: Image.Image,
     target_w_px: int,
@@ -57,8 +104,7 @@ def process_single_photo(
     bg_color: tuple = (255, 255, 255),
     inner_margin_px: int = 0,
 ) -> Image.Image:
-    """Ajusta una fotografía a las dimensiones exactas en píxeles a 300 DPI."""
-    # Rotación automática si la orientación de la foto no coincide con el papel
+    """Ajusta una fotografía a las dimensiones exactas en píxeles."""
     if auto_rotate:
         img_is_landscape = img.width > img.height
         target_is_landscape = target_w_px > target_h_px
@@ -76,7 +122,6 @@ def process_single_photo(
         )
         canvas.paste(processed, (inner_margin_px, inner_margin_px))
     else:
-        # Ajustar sin recortar (mantiene foto completa y deja margen blanco/color)
         processed = ImageOps.contain(
             img, (work_w, work_h), method=Image.Resampling.LANCZOS
         )
@@ -139,11 +184,12 @@ def build_multi_print_sheet(
     photo_w_px: int,
     photo_h_px: int,
     gap_px: int,
+    dpi: int,
     draw_cut_guides: bool = True,
 ) -> list:
-    """Acomoda múltiples fotos de tamaño estándar dentro de hojas Carta o A4 para ahorrar papel."""
+    """Acomoda múltiples fotos dentro de hojas Carta o A4 para ahorrar papel."""
     sheets = []
-    margin_px = cm_to_px(0.5)  # 5mm margen exterior
+    margin_px = cm_to_px(0.5, dpi)
 
     cols = max(1, (sheet_w_px - 2 * margin_px + gap_px) // (photo_w_px + gap_px))
     rows = max(1, (sheet_h_px - 2 * margin_px + gap_px) // (photo_h_px + gap_px))
@@ -172,22 +218,95 @@ def build_multi_print_sheet(
     return sheets
 
 
-def export_image_bytes(img: Image.Image, fmt: str = "JPEG") -> bytes:
+def export_image_bytes(img: Image.Image, dpi: int, fmt: str = "JPEG") -> bytes:
     buf = io.BytesIO()
     if fmt.upper() == "PDF":
-        img.save(buf, format="PDF", resolution=float(DPI))
+        img.save(buf, format="PDF", resolution=float(dpi))
     else:
-        img.save(buf, format="JPEG", quality=95, subsampling=0, dpi=(DPI, DPI))
+        img.save(buf, format="JPEG", quality=95, subsampling=0, dpi=(dpi, dpi))
     return buf.getvalue()
+
+
+def trigger_direct_browser_print(images_list: list, page_w_cm: float, page_h_cm: float, dpi: int):
+    """
+    Inyecta un iframe oculto con reglas CSS @page calibradas al tamaño físico del papel
+    y abre automáticamente el cuadro de diálogo de impresión del sistema operativo.
+    """
+    img_tags = []
+    for img in images_list:
+        raw_bytes = export_image_bytes(img, dpi=dpi, fmt="JPEG")
+        b64 = base64.b64encode(raw_bytes).decode("utf-8")
+        # Determinar si esta página individual es horizontal o vertical
+        is_land = img.width > img.height
+        w_page = max(page_w_cm, page_h_cm) if is_land else min(page_w_cm, page_h_cm)
+        h_page = min(page_w_cm, page_h_cm) if is_land else max(page_w_cm, page_h_cm)
+        img_tags.append(
+            f'<div class="print-page" style="width:{w_page}cm; height:{h_page}cm;">'
+            f'<img src="data:image/jpeg;base64,{b64}" />'
+            f"</div>"
+        )
+
+    pages_html = "\n".join(img_tags)
+
+    print_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        @page {{
+            size: {page_w_cm}cm {page_h_cm}cm;
+            margin: 0mm;
+        }}
+        html, body {{
+            margin: 0;
+            padding: 0;
+            background: white;
+        }}
+        .print-page {{
+            page-break-after: always;
+            break-after: page;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+        }}
+        .print-page:last-child {{
+            page-break-after: auto;
+            break-after: auto;
+        }}
+        img {{
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }}
+    </style>
+    </head>
+    <body>
+        {pages_html}
+        <script>
+            window.onload = function() {{
+                setTimeout(function() {{
+                    window.focus();
+                    window.print();
+                }}, 350);
+            }};
+        </script>
+    </body>
+    </html>
+    """
+    components.html(print_html, height=0, width=0)
 
 
 # --- INTERFAZ DE USUARIO ---
 st.title("📸 Estudio de Impresión Fotográfica y Póster")
 st.markdown(
-    "Prepara tus fotografías a **300 DPI** en tamaños estándar de laboratorio o diseña **pósteres fotográficos** listos para imprimir."
+    "Ajusta tus fotos a tamaños estándar, calibra el **tipo de papel y calidad**, e **imprime directamente** desde tu navegador o descarga para laboratorio."
 )
 
-tab1, tab2 = st.tabs(["🖼️ Ajustar Fotos para Impresión", "🧩 Crear Póster Fotográfico"])
+tab1, tab2 = st.tabs(["🖨️ Ajustar e Imprimir Fotos", "🧩 Crear e Imprimir Póster"])
 
 # ==========================================
 # PESTAÑA 1: IMPRESIÓN DE FOTOS ESTÁNDAR
@@ -204,9 +323,23 @@ with tab1:
             key="uploader_std",
         )
 
-        st.subheader("2. Configuración de Tamaño")
+        st.subheader("2. Papel, Calidad y Tamaño")
+        paper_choice_1 = st.selectbox(
+            "Tipo de papel fotográfico",
+            options=list(PAPER_PROFILES.keys()),
+            index=0,
+            key="paper_1",
+        )
+        quality_choice_1 = st.selectbox(
+            "Calidad de impresión",
+            options=list(QUALITY_PROFILES.keys()),
+            index=0,
+            key="qual_1",
+        )
+        selected_dpi_1 = QUALITY_PROFILES[quality_choice_1]
+
         size_label = st.selectbox(
-            "Tamaño de fotografía deseado",
+            "Tamaño de fotografía",
             options=list(PHOTO_SIZES_CM.keys())[:8],
             index=1,  # 10 x 15 cm por defecto
         )
@@ -225,7 +358,7 @@ with tab1:
 
         st.subheader("3. Ahorro de Papel (Opcional)")
         pack_on_sheet = st.checkbox(
-            "Agrupar varias fotos en hoja Carta o A4 para imprimir en casa",
+            "Agrupar varias fotos en hoja Carta o A4",
             value=False,
         )
         if pack_on_sheet:
@@ -235,10 +368,8 @@ with tab1:
             )
             cut_guides = st.checkbox("Dibujar líneas guía de corte", value=True)
 
-        export_fmt_1 = st.selectbox("Formato de descarga", ["JPEG (300 DPI)", "PDF (Listo para imprimir)"])
-
     with col_prev:
-        st.subheader("Vista Previa y Descarga")
+        st.subheader("Vista Previa e Impresión Directa")
         if uploaded_photos:
             w_cm, h_cm = PHOTO_SIZES_CM[size_label]
             if orientation == "Horizontal (Paisaje)":
@@ -246,82 +377,53 @@ with tab1:
             elif orientation == "Vertical (Retrato)":
                 w_cm, h_cm = min(w_cm, h_cm), max(w_cm, h_cm)
 
-            target_w = cm_to_px(w_cm)
-            target_h = cm_to_px(h_cm)
+            target_w = cm_to_px(w_cm, selected_dpi_1)
+            target_h = cm_to_px(h_cm, selected_dpi_1)
             auto_rot = orientation == "Automática (según cada foto)"
 
             processed_list = []
             for up in uploaded_photos:
                 raw_img = load_image_corrected(up)
+                opt_img = apply_paper_optimization(raw_img, paper_choice_1)
                 proc = process_single_photo(
-                    raw_img,
+                    opt_img,
                     target_w,
                     target_h,
                     fit_mode=fit_mode,
                     auto_rotate=auto_rot,
-                    inner_margin_px=cm_to_px(border_mm / 10.0),
+                    inner_margin_px=cm_to_px(border_mm / 10.0, selected_dpi_1),
                 )
                 processed_list.append((up.name, proc))
 
-            fmt_code = "PDF" if "PDF" in export_fmt_1 else "JPEG"
-            ext = "pdf" if fmt_code == "PDF" else "jpg"
-
             if pack_on_sheet:
                 sw_cm, sh_cm = PHOTO_SIZES_CM[sheet_type]
-                # Para agrupar usamos orientación fija de cada foto
                 fixed_photos = [
                     process_single_photo(
-                        load_image_corrected(up),
+                        apply_paper_optimization(load_image_corrected(up), paper_choice_1),
                         target_w,
                         target_h,
                         fit_mode=fit_mode,
                         auto_rotate=False,
-                        inner_margin_px=cm_to_px(border_mm / 10.0),
+                        inner_margin_px=cm_to_px(border_mm / 10.0, selected_dpi_1),
                     )
                     for up in uploaded_photos
                 ]
-                sheets = build_multi_print_sheet(
+                final_pages = build_multi_print_sheet(
                     fixed_photos,
-                    cm_to_px(sw_cm),
-                    cm_to_px(sh_cm),
+                    cm_to_px(sw_cm, selected_dpi_1),
+                    cm_to_px(sh_cm, selected_dpi_1),
                     target_w,
                     target_h,
-                    gap_px=cm_to_px(0.3),
+                    gap_px=cm_to_px(0.3, selected_dpi_1),
+                    dpi=selected_dpi_1,
                     draw_cut_guides=cut_guides,
                 )
-                st.info(f"Se generaron **{len(sheets)} hoja(s)** tamaño {sheet_type} con tus fotos acomodadas.")
-                st.image(sheets[0], caption="Vista previa Hoja 1", use_container_width=True)
-
-                if fmt_code == "PDF":
-                    pdf_buf = io.BytesIO()
-                    sheets[0].save(
-                        pdf_buf,
-                        format="PDF",
-                        resolution=float(DPI),
-                        save_all=True,
-                        append_images=sheets[1:],
-                    )
-                    st.download_button(
-                        "⬇️ Descargar Hojas en PDF",
-                        data=pdf_buf.getvalue(),
-                        file_name="hojas_fotograficas.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                    )
-                else:
-                    zip_buf = io.BytesIO()
-                    with zipfile.ZipFile(zip_buf, "w") as zf:
-                        for i, sh in enumerate(sheets, 1):
-                            zf.writestr(f"hoja_{i}.jpg", export_image_bytes(sh, "JPEG"))
-                    st.download_button(
-                        "⬇️ Descargar Hojas en ZIP (JPG 300 DPI)",
-                        data=zip_buf.getvalue(),
-                        file_name="hojas_fotograficas.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                    )
+                print_w_cm, print_h_cm = sw_cm, sh_cm
+                st.info(f"Se prepararon **{len(final_pages)} hoja(s)** tamaño {sheet_type} a **{selected_dpi_1} DPI**.")
+                st.image(final_pages[0], caption="Vista previa Hoja 1", use_container_width=True)
             else:
-                # Mostrar vista previa en cuadrícula
+                final_pages = [x[1] for x in processed_list]
+                print_w_cm, print_h_cm = w_cm, h_cm
                 prev_cols = st.columns(min(3, len(processed_list)))
                 for idx, (fname, pimg) in enumerate(processed_list):
                     with prev_cols[idx % 3]:
@@ -331,50 +433,39 @@ with tab1:
                             use_container_width=True,
                         )
 
-                if len(processed_list) == 1:
-                    fname, single_img = processed_list[0]
-                    base_name = fname.rsplit(".", 1)[0]
+            st.caption(f"💡 **Ajuste recomendado en tu impresora:** {PAPER_PROFILES[paper_choice_1]['tip']}")
+
+            # Botón de Impresión Directa
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if st.button("🖨️ Imprimir Directamente Ahora", type="primary", use_container_width=True, key="btn_print_1"):
+                    trigger_direct_browser_print(final_pages, print_w_cm, print_h_cm, selected_dpi_1)
+
+            with btn_col2:
+                if len(final_pages) == 1:
                     st.download_button(
-                        f"⬇️ Descargar Foto Ajustada ({ext.upper()})",
-                        data=export_image_bytes(single_img, fmt_code),
-                        file_name=f"{base_name}_{w_cm:.0f}x{h_cm:.0f}cm.{ext}",
-                        mime="application/pdf" if fmt_code == "PDF" else "image/jpeg",
+                        f"⬇️ Descargar JPG ({selected_dpi_1} DPI)",
+                        data=export_image_bytes(final_pages[0], selected_dpi_1, "JPEG"),
+                        file_name=f"foto_{print_w_cm:.0f}x{print_h_cm:.0f}cm_{selected_dpi_1}dpi.jpg",
+                        mime="image/jpeg",
                         use_container_width=True,
                     )
                 else:
-                    if fmt_code == "PDF":
-                        pdf_buf = io.BytesIO()
-                        imgs_only = [x[1] for x in processed_list]
-                        imgs_only[0].save(
-                            pdf_buf,
-                            format="PDF",
-                            resolution=float(DPI),
-                            save_all=True,
-                            append_images=imgs_only[1:],
-                        )
-                        st.download_button(
-                            "⬇️ Descargar Todas las Fotos en 1 PDF",
-                            data=pdf_buf.getvalue(),
-                            file_name=f"fotos_{w_cm:.0f}x{h_cm:.0f}cm.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                        )
-                    else:
-                        zip_buf = io.BytesIO()
-                        with zipfile.ZipFile(zip_buf, "w") as zf:
-                            for idx, (fname, pimg) in enumerate(processed_list, 1):
-                                base_name = fname.rsplit(".", 1)[0]
-                                zf.writestr(
-                                    f"{idx:02d}_{base_name}_{w_cm:.0f}x{h_cm:.0f}cm.jpg",
-                                    export_image_bytes(pimg, "JPEG"),
-                                )
-                        st.download_button(
-                            "⬇️ Descargar Todas las Fotos en ZIP (JPG 300 DPI)",
-                            data=zip_buf.getvalue(),
-                            file_name=f"fotos_{w_cm:.0f}x{h_cm:.0f}cm.zip",
-                            mime="application/zip",
-                            use_container_width=True,
-                        )
+                    pdf_buf = io.BytesIO()
+                    final_pages[0].save(
+                        pdf_buf,
+                        format="PDF",
+                        resolution=float(selected_dpi_1),
+                        save_all=True,
+                        append_images=final_pages[1:],
+                    )
+                    st.download_button(
+                        f"⬇️ Descargar PDF ({len(final_pages)} págs)",
+                        data=pdf_buf.getvalue(),
+                        file_name=f"lote_fotos_{selected_dpi_1}dpi.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
         else:
             st.info("👈 Sube una o varias fotografías en el panel izquierdo para comenzar.")
 
@@ -393,9 +484,23 @@ with tab2:
             key="uploader_poster",
         )
 
-        st.subheader("2. Tamaño del Póster")
+        st.subheader("2. Papel, Calidad y Tamaño")
+        paper_choice_2 = st.selectbox(
+            "Tipo de papel del póster",
+            options=list(PAPER_PROFILES.keys()),
+            index=0,
+            key="paper_2",
+        )
+        quality_choice_2 = st.selectbox(
+            "Calidad / Resolución de salida",
+            options=list(QUALITY_PROFILES.keys()),
+            index=0,
+            key="qual_2",
+        )
+        selected_dpi_2 = QUALITY_PROFILES[quality_choice_2]
+
         poster_size_label = st.selectbox(
-            "Dimensiones finales de impresión",
+            "Dimensiones finales del póster",
             options=list(PHOTO_SIZES_CM.keys())[4:],
             index=4,  # 30 x 40 cm por defecto
         )
@@ -425,13 +530,9 @@ with tab2:
             "Ajuste dentro de cada celda",
             ["Recortar para llenar cada cuadro", "Mostrar foto completa sin recortar"],
         )
-        export_fmt_poster = st.selectbox(
-            "Formato de salida del Póster",
-            ["JPEG Alta Calidad (300 DPI)", "PDF para Impresión Gran Formato"],
-        )
 
     with p_col_prev:
-        st.subheader("Vista Previa del Póster")
+        st.subheader("Vista Previa e Impresión del Póster")
         if poster_files:
             pw_cm, ph_cm = PHOTO_SIZES_CM[poster_size_label]
             if poster_orient == "Horizontal":
@@ -439,14 +540,17 @@ with tab2:
             else:
                 pw_cm, ph_cm = min(pw_cm, ph_cm), max(pw_cm, ph_cm)
 
-            pw_px = cm_to_px(pw_cm)
-            ph_px = cm_to_px(ph_cm)
+            pw_px = cm_to_px(pw_cm, selected_dpi_2)
+            ph_px = cm_to_px(ph_cm, selected_dpi_2)
 
-            loaded_poster_imgs = [load_image_corrected(f) for f in poster_files]
+            loaded_poster_imgs = [
+                apply_paper_optimization(load_image_corrected(f), paper_choice_2)
+                for f in poster_files
+            ]
             capacity = grid_cols * grid_rows
             if len(loaded_poster_imgs) > capacity:
                 st.warning(
-                    f"Subiste {len(loaded_poster_imgs)} fotos, pero la cuadrícula de {grid_cols}x{grid_rows} solo tiene espacio para {capacity}. Aumenta filas o columnas para incluirlas todas."
+                    f"Subiste {len(loaded_poster_imgs)} fotos, pero la cuadrícula de {grid_cols}x{grid_rows} solo tiene espacio para {capacity}. Aumenta filas o columnas."
                 )
 
             poster_img = build_poster_collage(
@@ -455,30 +559,41 @@ with tab2:
                 poster_h_px=ph_px,
                 cols=grid_cols,
                 rows=grid_rows,
-                margin_px=cm_to_px(poster_margin_mm / 10.0),
-                gap_px=cm_to_px(poster_gap_mm / 10.0),
+                margin_px=cm_to_px(poster_margin_mm / 10.0, selected_dpi_2),
+                gap_px=cm_to_px(poster_gap_mm / 10.0, selected_dpi_2),
                 bg_color=bg_rgb,
                 cell_fit_mode=cell_fit,
             )
 
-            # Vista previa optimizada en pantalla para evitar lag en resoluciones 50x70 / 60x90 cm
             preview_copy = poster_img.copy()
             preview_copy.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
             st.image(
                 preview_copy,
-                caption=f"Póster {pw_cm:.0f} x {ph_cm:.0f} cm | Resolución real: {pw_px} x {ph_px} px (300 DPI)",
+                caption=f"Póster {pw_cm:.0f} x {ph_cm:.0f} cm | {pw_px} x {ph_px} px ({selected_dpi_2} DPI)",
                 use_container_width=True,
             )
 
-            p_fmt = "PDF" if "PDF" in export_fmt_poster else "JPEG"
-            p_ext = "pdf" if p_fmt == "PDF" else "jpg"
+            st.caption(f"💡 **Ajuste recomendado en tu impresora:** {PAPER_PROFILES[paper_choice_2]['tip']}")
 
-            st.download_button(
-                f"⬇️ Descargar Póster ({pw_cm:.0f}x{ph_cm:.0f} cm - {p_ext.upper()})",
-                data=export_image_bytes(poster_img, p_fmt),
-                file_name=f"poster_{pw_cm:.0f}x{ph_cm:.0f}cm.{p_ext}",
-                mime="application/pdf" if p_fmt == "PDF" else "image/jpeg",
-                use_container_width=True,
-            )
+            p_btn1, p_btn2, p_btn3 = st.columns(3)
+            with p_btn1:
+                if st.button("🖨️ Imprimir Póster Ahora", type="primary", use_container_width=True, key="btn_print_poster"):
+                    trigger_direct_browser_print([poster_img], pw_cm, ph_cm, selected_dpi_2)
+            with p_btn2:
+                st.download_button(
+                    "⬇️ Descargar JPG",
+                    data=export_image_bytes(poster_img, selected_dpi_2, "JPEG"),
+                    file_name=f"poster_{pw_cm:.0f}x{ph_cm:.0f}cm_{selected_dpi_2}dpi.jpg",
+                    mime="image/jpeg",
+                    use_container_width=True,
+                )
+            with p_btn3:
+                st.download_button(
+                    "⬇️ Descargar PDF",
+                    data=export_image_bytes(poster_img, selected_dpi_2, "PDF"),
+                    file_name=f"poster_{pw_cm:.0f}x{ph_cm:.0f}cm_{selected_dpi_2}dpi.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
         else:
             st.info("👈 Selecciona varias fotografías en el panel izquierdo para armar tu póster.")
